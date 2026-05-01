@@ -9,6 +9,12 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 TOKEN = '8459034854:AAFOvbK3i2jJS8fNkGP8TAS6F2yvW6c_UiE'
 ADMIN_USERNAME = '@nazihboumahni'
 
+# إحداثيات منطقة الصورة (لقالب 1000×1000)
+PHOTO_X = 438
+PHOTO_Y = 96
+PHOTO_WIDTH = 507
+PHOTO_HEIGHT = 522
+
 bot = telebot.TeleBot(TOKEN)
 
 try:
@@ -18,6 +24,16 @@ try:
 except Exception as e:
     logging.error(f"لم يتم العثور على حساب الأدمن {ADMIN_USERNAME}: {e}")
     ADMIN_ID = None
+
+def has_transparency(img):
+    """التحقق مما إذا كانت الصورة تحتوي على بكسلات شفافة"""
+    if img.mode != 'RGBA':
+        return False
+    alpha = img.getchannel('A')
+    # إذا كان هناك أي بكسل بقيمة alpha أقل من 255 (شفاف جزئياً أو كلياً)
+    if alpha.getextrema() != (255, 255):
+        return True
+    return False
 
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
@@ -29,7 +45,6 @@ def send_welcome(message):
         "📌 إذا لم تنضم بعد لعائلة المنتدى، يمكنك التسجيل عبر الرابط التالي:\n"
         "https://nazaha-dz.vercel.app\n\n"
         "📌 للمشاركة وإضافة صورتك في القالب الرسمي:\n"
-        "ادخل عبر الرابط التالي مباشرة (استخدم خيار \"استعمال القالب\"):\n"
         "https://t.me/nazahadz_bot\n\n"
         "📌 شارك تصميمك الآن على حساباتك في مواقع التواصل الاجتماعي، وساهم في نشر الوعي بين أصدقائك.\n\n"
         "📌 كما سيتم نشر صور سفراء \"نزاهة\" عبر منصاتنا الرسمية تقديراً لمبادرتهم.\n\n"
@@ -43,10 +58,12 @@ def handle_photo(message):
     processing_msg = bot.reply_to(message, "جارٍ معالجة الصورة ودمجها مع قالب نزاهة، يرجى الانتظار...")
     
     try:
+        # تحميل صورة المستخدم
         file_info = bot.get_file(message.photo[-1].file_id)
         downloaded_file = bot.download_file(file_info.file_path)
         user_img = Image.open(io.BytesIO(downloaded_file)).convert("RGBA")
-
+        
+        # تحميل القالب
         try:
             template = Image.open("nazaha_template.png").convert("RGBA")
         except FileNotFoundError:
@@ -57,9 +74,21 @@ def handle_photo(message):
             )
             return
         
-        user_img = user_img.resize(template.size)
-        final_img = Image.alpha_composite(user_img, template)
+        # تغيير حجم صورة المستخدم لتتناسب مع المساحة المحددة
+        user_img_resized = user_img.resize((PHOTO_WIDTH, PHOTO_HEIGHT))
         
+        # التحقق من وجود شفافية في القالب
+        if has_transparency(template):
+            # طريقة الدمج مع الشفافية: صورة المستخدم خلف القالب
+            background = Image.new('RGBA', template.size, (0, 0, 0, 0))
+            background.paste(user_img_resized, (PHOTO_X, PHOTO_Y))
+            final_img = Image.alpha_composite(background, template)
+        else:
+            # طريقة الدمج العادي: صورة المستخدم فوق القالب
+            final_img = template.copy()
+            final_img.paste(user_img_resized, (PHOTO_X, PHOTO_Y), user_img_resized if user_img_resized.mode == 'RGBA' else None)
+        
+        # تحويل الصورة النهائية إلى بايتات
         output = io.BytesIO()
         final_img.save(output, format="PNG")
         output.seek(0)
@@ -81,6 +110,7 @@ def handle_photo(message):
         bot.delete_message(message.chat.id, processing_msg.message_id)
         bot.send_photo(message.chat.id, output, caption=caption_text)
         
+        # إرسال نسخة إلى الأدمن
         if ADMIN_ID:
             output.seek(0)
             admin_caption = (
