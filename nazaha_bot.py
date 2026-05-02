@@ -4,690 +4,1137 @@ import sqlite3
 import json
 import requests
 import datetime
-import re
-import io
-import qrcode
-from PIL import Image, ImageDraw, ImageFont
-import time
 import logging
+import re
+import os
+import time
+import threading
+from collections import defaultdict
 
-# ------------------- الإعدادات -------------------
-TOKEN = '8459034854:AAFOvbK3i2jJS8fNkGP8TAS6F2yvW6c_UiE'
-ADMIN_PASSWORD = 'nazaha2026'            # كلمة مرور الدخول إلى وضع الإدارة
-JSON_URL = 'https://raw.githubusercontent.com/nazahaa36/com/main/member.json'
+# ========== الإعدادات والأمان ==========
+TOKEN = os.environ.get('NAZAHA_BOT_TOKEN', 'YOUR_BOT_TOKEN_HERE')  # ضع التوكن الخاص بك هنا
+ADMIN_PASSWORD = os.environ.get('NAZAHA_ADMIN_PASSWORD', 'nazaha2026')
+JSON_MEMBERS_URL = 'https://raw.githubusercontent.com/nazahaa36/com/main/member.json'
+BACKUP_DIR = 'backups'
 
 bot = telebot.TeleBot(TOKEN)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# جلسات المستخدمين (chat_id -> user_id)
-user_sessions = {}
+# إنشاء مجلد النسخ الاحتياطي
+os.makedirs(BACKUP_DIR, exist_ok=True)
 
-# ------------------- قاعدة البيانات -------------------
-conn = sqlite3.connect('nazaha_bot.db', check_same_thread=False)
+# ========== قاعدة البيانات ==========
+conn = sqlite3.connect('nazaha.db', check_same_thread=False)
 c = conn.cursor()
 
-# جدول الجلسات (من سجل الدخول)
+# جدول الجلسات
 c.execute('''CREATE TABLE IF NOT EXISTS sessions (
     chat_id INTEGER PRIMARY KEY,
     user_id TEXT,
     full_name TEXT,
     role TEXT,
-    status TEXT DEFAULT 'active'
+    login_time TEXT
 )''')
 
-# جدول الرسائل
-c.execute('''CREATE TABLE IF NOT EXISTS messages (
+# جدول الطلبات
+c.execute('''CREATE TABLE IF NOT EXISTS requests (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    from_user_id TEXT,
-    from_name TEXT,
-    to_user_id TEXT,
-    subject TEXT,
-    body TEXT,
-    date TEXT,
-    is_read INTEGER DEFAULT 0,
-    reply_to INTEGER DEFAULT NULL
+    request_number TEXT,
+    user_id TEXT,
+    user_name TEXT,
+    request_type TEXT,
+    details TEXT,
+    status TEXT DEFAULT 'pending',
+    created_at TEXT,
+    handled_by TEXT,
+    handled_at TEXT
 )''')
 
 # جدول الحضور
 c.execute('''CREATE TABLE IF NOT EXISTS attendance (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id TEXT,
-    full_name TEXT,
+    user_name TEXT,
     date TEXT,
     time TEXT,
-    activity TEXT DEFAULT 'حضور عام'
+    note TEXT
 )''')
 
-# جدول الشهادات
-c.execute('''CREATE TABLE IF NOT EXISTS certificates (
+# جدول المراسلات
+c.execute('''CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id TEXT,
-    full_name TEXT,
-    title TEXT,
-    reason TEXT,
-    date TEXT,
-    place TEXT,
-    issued_by TEXT DEFAULT 'إدارة المنتدى'
-)''')
-
-# جدول الخطابات
-c.execute('''CREATE TABLE IF NOT EXISTS letters (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    to_whom TEXT,
-    subject TEXT,
-    body TEXT,
-    date TEXT,
-    created_by TEXT
-)''')
-
-# جدول التقارير
-c.execute('''CREATE TABLE IF NOT EXISTS reports (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    title TEXT,
-    type TEXT,
+    from_id TEXT,
+    from_name TEXT,
+    to_id TEXT,
     content TEXT,
     date TEXT,
-    created_by TEXT
+    is_read INTEGER DEFAULT 0,
+    reply_to INTEGER
 )''')
 
-# جدول المبادرات (من الـ JSON أو يضاف يدوياً)
-c.execute('''CREATE TABLE IF NOT EXISTS initiatives (
+# جدول المهام (للمتطوعين)
+c.execute('''CREATE TABLE IF NOT EXISTS tasks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     title TEXT,
     description TEXT,
-    date TEXT,
-    link TEXT,
-    status TEXT DEFAULT 'نشطة'
+    assigned_to TEXT,
+    assigned_by TEXT,
+    status TEXT DEFAULT 'pending',
+    priority TEXT DEFAULT 'normal',
+    created_at TEXT,
+    due_date TEXT,
+    completed_at TEXT
 )''')
 
-# جدول النشاطات
-c.execute('''CREATE TABLE IF NOT EXISTS activities (
+# جدول سجل النشاطات
+c.execute('''CREATE TABLE IF NOT EXISTS activity_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    title TEXT,
-    date TEXT,
-    time TEXT,
-    location TEXT,
-    description TEXT,
-    type TEXT
-)''')
-
-# جدول طلبات الأعضاء (مثل طلب تغيير بيانات، طلب شهادة، إلخ)
-c.execute('''CREATE TABLE IF NOT EXISTS requests (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    from_user_id TEXT,
-    from_name TEXT,
-    request_type TEXT,
+    user_id TEXT,
+    action TEXT,
     details TEXT,
-    date TEXT,
-    status TEXT DEFAULT 'pending'
+    created_at TEXT
 )''')
 
 conn.commit()
 
-# ------------------- دوال مساعدة -------------------
-def get_members_from_json():
-    """تحميل بيانات الأعضاء من الرابط مع محاولة إعادة المحاولة"""
+# ========== دوال مساعدة خاصة بالـ JSON (المصححة) ==========
+def get_members():
+    """جلب الأعضاء من JSON مع تصفية السجلات الفارغة - متوافق مع JSON الحقيقي"""
     try:
-        resp = requests.get(JSON_URL, timeout=10)
+        resp = requests.get(JSON_MEMBERS_URL, timeout=15)
         resp.raise_for_status()
         data = resp.json()
-        if isinstance(data, list):
-            return data
-        elif isinstance(data, dict) and 'members' in data:
-            return data['members']
-        else:
-            return []
+        members = data if isinstance(data, list) else data.get('members', [])
+        # تصفية السجلات التي تحتوي على id و fullName على الأقل
+        valid_members = [m for m in members if m.get('id') and m.get('fullName')]
+        return valid_members
     except Exception as e:
-        logging.error(f"خطأ في تحميل JSON: {e}")
+        logging.error(f"خطأ في جلب البيانات: {e}")
         return []
 
 def get_member_by_id(user_id):
-    """البحث عن عضو (عادي أو متطوع) من JSON"""
-    members = get_members_from_json()
-    for m in members:
+    for m in get_members():
         if str(m.get('id')) == str(user_id):
             return m
     return None
 
-def get_user_role_from_json(user_id):
-    """تحديد الدور: 'member' أو 'volunteer' (موظف)"""
+def get_member_by_name(name):
+    name = name.strip().lower()
+    for m in get_members():
+        if name in m.get('fullName', '').lower():
+            return m
+    return None
+
+def check_login(user_id, password):
     member = get_member_by_id(user_id)
     if not member:
-        return None
-    # افتراض أن حقل 'type' أو 'cadreType' يحتوي على 'موظف' للمتطوع
-    user_type = member.get('type') or member.get('cadreType') or 'عضو'
-    if user_type == 'موظف' or user_type == 'متطوع':
-        return 'volunteer'
-    else:
-        return 'member'
+        return False, None
+    stored_password = member.get('password', '')
+    if stored_password and stored_password == password:
+        return True, member
+    return False, None
 
-def is_admin_mode(chat_id):
-    """هل المستخدم في وضع الإدارة؟ نتحقق من الجلسة"""
+def get_user_role(member):
+    """تحديد دور المستخدم حسب JSON: 'عضو' أو 'موظف'"""
+    user_type = member.get('type', 'عضو')
+    # في JSON الخاص بك: 'موظف' = متطوع، 'عضو' = منخرط
+    return 'volunteer' if user_type == 'موظف' else 'member'
+
+def get_cell_display(member):
+    """إرجاع نص الخلية مع التعامل مع القيم الفارغة"""
+    cell = member.get('cell', '').strip()
+    if cell:
+        return cell
+    member_type = member.get('type', 'عضو')
+    if member_type == 'عضو':
+        return "📌 غير مسند لخلية (منخرط عام)"
+    return "📌 غير مسند لخلية"
+
+def get_position_display(member):
+    """إرجاع نص المنصب مع التعامل مع القيم الفارغة"""
+    position = member.get('position', '').strip()
+    if position:
+        return position
+    return "—"
+
+def format_member_info(member):
+    """تنسيق معلومات العضو بشكل جميل وآمن - متوافق مع JSON الحقيقي"""
+    cell_display = get_cell_display(member)
+    position_display = get_position_display(member)
+    
+    # تعيين النوع للعرض: 'عضو' -> منخرط، 'موظف' -> متطوع
+    display_type = "منخرط" if member.get('type') == 'عضو' else "متطوع"
+    
+    text = f"""
+👤 *البطاقة الشخصية*
+
+🆔 *الرقم التعريفي:* `{member.get('id', '-')}`
+📛 *الاسم الكامل:* {member.get('fullName', '-')}
+🏷️ *الصفة:* {display_type}
+📌 *الخلية:* {cell_display}
+💼 *المنصب:* {position_display}
+
+📞 *الهاتف:* `{member.get('phone', '-')}`
+📧 *البريد:* {member.get('email', '-')}
+🎂 *تاريخ الميلاد:* {member.get('birthDate', '-')}
+🏠 *العنوان:* {member.get('address', '-')}
+
+🎓 *المستوى الدراسي:* {member.get('education', '-')}
+⚡ *الاهتمامات/التخصص:* {member.get('specialty', '-')}
+
+📅 *تاريخ الانضمام:* {member.get('hiringDate', '-')}
+⏰ *تاريخ الانتهاء:* {member.get('expiryDate', '-')}
+    """
+    return text
+
+def get_all_cells():
+    """جلب قائمة الخلايا الفريدة من الأعضاء"""
+    cells = set()
+    for m in get_members():
+        cell = m.get('cell', '').strip()
+        if cell:
+            cells.add(cell)
+    return sorted(list(cells))
+
+def get_members_by_cell(cell_name):
+    """جلب الأعضاء حسب الخلية"""
+    return [m for m in get_members() if m.get('cell', '').strip() == cell_name]
+
+def get_members_without_cell():
+    """جلب المنخرطين (عضو) بدون خلية"""
+    return [m for m in get_members() if not m.get('cell', '').strip() and m.get('type') == 'عضو']
+
+def send_notification_to_admin(text, reply_markup=None):
+    admins = c.execute("SELECT chat_id FROM sessions WHERE role='admin'").fetchall()
+    for admin in admins:
+        try:
+            bot.send_message(admin[0], text, parse_mode='Markdown', reply_markup=reply_markup)
+        except:
+            pass
+
+def generate_request_number():
+    return f"REQ-{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}"
+
+def log_activity(user_id, action, details=""):
+    c.execute("INSERT INTO activity_log (user_id, action, details, created_at) VALUES (?, ?, ?, ?)",
+              (user_id, action, details, datetime.datetime.now().isoformat()))
+    conn.commit()
+
+def backup_database():
+    """نسخ احتياطي لقاعدة البيانات"""
+    try:
+        timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        backup_path = os.path.join(BACKUP_DIR, f'nazaha_backup_{timestamp}.db')
+        import shutil
+        shutil.copy2('nazaha.db', backup_path)
+        # حذف النسخ القديمة (أكثر من 10)
+        backups = sorted([f for f in os.listdir(BACKUP_DIR) if f.endswith('.db')])
+        for old in backups[:-10]:
+            os.remove(os.path.join(BACKUP_DIR, old))
+        return backup_path
+    except Exception as e:
+        logging.error(f"Backup error: {e}")
+        return None
+
+def is_admin(chat_id):
     session = c.execute("SELECT role FROM sessions WHERE chat_id=?", (chat_id,)).fetchone()
     return session and session[0] == 'admin'
 
-def generate_member_card(user_record):
-    """إنشاء بطاقة عضوية كصورة مع باركود وبيانات"""
-    # user_record هو قاموس من JSON
-    img = Image.new('RGB', (650, 400), color='#f8f9fa')
-    draw = ImageDraw.Draw(img)
-    try:
-        font_title = ImageFont.truetype("arial.ttf", 22)
-        font_normal = ImageFont.truetype("arial.ttf", 16)
-        font_small = ImageFont.truetype("arial.ttf", 12)
-    except:
-        font_title = font_normal = font_small = ImageFont.load_default()
-
-    # خلفية ملوّنة
-    draw.rectangle([(0,0), (650,100)], fill='#2ecc71')
-    draw.text((30, 30), user_record.get('fullName', 'لا يوجد'), fill='white', font=font_title)
-    draw.text((30, 70), f"رقم العضوية: {user_record.get('id')}", fill='white', font=font_normal)
-
-    # معلومات إضافية
-    y = 120
-    info_lines = [
-        f"النوع: {user_record.get('type', 'عضو')}",
-        f"الخلية: {user_record.get('cell', '-')}",
-        f"المنصب: {user_record.get('position', '-')}",
-        f"تاريخ الميلاد: {user_record.get('birthDate', '-')}",
-        f"تاريخ التسجيل: {user_record.get('hiringDate', '-')}",
-        f"تاريخ الانتهاء: {user_record.get('expiryDate', '-')}",
-        f"الهاتف: {user_record.get('phone', '-')}",
-        f"البريد: {user_record.get('email', '-')}"
-    ]
-    for line in info_lines:
-        draw.text((30, y), line, fill='#333', font=font_normal)
-        y += 28
-
-    # باركود
-    qr = qrcode.make(user_record.get('id'))
-    qr = qr.resize((120, 120))
-    img.paste(qr, (500, 250))
-
-    output = io.BytesIO()
-    img.save(output, format='PNG')
-    output.seek(0)
-    return output
-
-# ------------------- واجهة الأدمن الرئيسية -------------------
-def admin_main_menu(chat_id):
+# ========== القوائم الرئيسية (مع حفظ جميع الميزات) ==========
+def admin_menu(chat_id):
     markup = InlineKeyboardMarkup(row_width=2)
     markup.add(
-        InlineKeyboardButton("👥 إدارة الأعضاء", callback_data="admin_members"),
-        InlineKeyboardButton("➕ إضافة عضو/متطوع", callback_data="admin_add_user"),
-        InlineKeyboardButton("📨 الرسائل الواردة", callback_data="admin_inbox"),
+        InlineKeyboardButton("📋 الطلبات", callback_data="admin_requests"),
+        InlineKeyboardButton("🔍 استعلام", callback_data="admin_search"),
+        InlineKeyboardButton("👥 الأعضاء", callback_data="admin_members"),
+        InlineKeyboardButton("🏛️ الخلايا", callback_data="admin_cells"),
+        InlineKeyboardButton("✅ الحضور", callback_data="admin_attendance"),
+        InlineKeyboardButton("📨 الرسائل", callback_data="admin_messages"),
         InlineKeyboardButton("📊 الإحصائيات", callback_data="admin_stats"),
-        InlineKeyboardButton("📜 الشهادات", callback_data="admin_certs"),
-        InlineKeyboardButton("✉️ الخطابات", callback_data="admin_letters"),
-        InlineKeyboardButton("📄 التقارير", callback_data="admin_reports"),
-        InlineKeyboardButton("✅ الحضور والغياب", callback_data="admin_attendance"),
-        InlineKeyboardButton("📢 إشعار جماعي", callback_data="admin_broadcast"),
-        InlineKeyboardButton("💡 المبادرات", callback_data="admin_initiatives"),
-        InlineKeyboardButton("📅 النشاطات", callback_data="admin_activities"),
-        InlineKeyboardButton("📋 طلبات الأعضاء", callback_data="admin_requests"),
-        InlineKeyboardButton("🚪 تسجيل الخروج", callback_data="admin_logout")
+        InlineKeyboardButton("📢 إشعار", callback_data="admin_broadcast"),
+        InlineKeyboardButton("⚡ المهام", callback_data="admin_tasks"),
+        InlineKeyboardButton("💾 نسخ احتياطي", callback_data="admin_backup"),
+        InlineKeyboardButton("📜 السجل", callback_data="admin_logs"),
+        InlineKeyboardButton("🚪 خروج", callback_data="admin_logout")
     )
-    bot.send_message(chat_id, "*🛡️ لوحة تحكم الأدمن - نزاهة*\nاختر الخدمة المطلوبة:", parse_mode='Markdown', reply_markup=markup)
+    bot.send_message(chat_id, "🛡️ *لوحة تحكم الأدمن - نظام نزاهة*\n\nاختر الخدمة المطلوبة:", parse_mode='Markdown', reply_markup=markup)
 
-# ------------------- واجهة العضو / المتطوع -------------------
-def user_main_menu(chat_id, user_record):
-    role = get_user_role_from_json(user_record.get('id'))
-    is_volunteer = (role == 'volunteer')
+def user_menu(chat_id, member):
+    role = get_user_role(member)
     markup = InlineKeyboardMarkup(row_width=2)
-    markup.add(
+    
+    buttons = [
         InlineKeyboardButton("👤 ملفي الشخصي", callback_data="user_profile"),
-        InlineKeyboardButton("📨 إرسال رسالة للإدارة", callback_data="user_send_message"),
-        InlineKeyboardButton("✅ تسجيل حضور", callback_data="user_attendance_self"),
-        InlineKeyboardButton("💡 اقتراح فكرة أو مبادرة", callback_data="user_idea"),
-        InlineKeyboardButton("🤝 التبرع للمنتدى", callback_data="user_donate"),
-        InlineKeyboardButton("🔄 تجديد العهدة", callback_data="user_renew"),
-        InlineKeyboardButton("✏️ طلب تعديل بياناتي", callback_data="user_update_data"),
-        InlineKeyboardButton("📜 طلب شهادة تقدير", callback_data="user_request_cert"),
-        InlineKeyboardButton("📧 طلب خطاب رسمي", callback_data="user_request_letter")
-    )
-    if is_volunteer:
-        markup.add(InlineKeyboardButton("📋 مهامي", callback_data="volunteer_tasks"))
-    bot.send_message(chat_id, f"*أهلاً بك {user_record.get('fullName')}*\nنرحب بانضمامك إلى منصة نزاهة. يمكنك استخدام الأزرار التالية:", parse_mode='Markdown', reply_markup=markup)
+        InlineKeyboardButton("🔍 البحث عن عضو", callback_data="user_search"),
+        InlineKeyboardButton("📨 مراسلة الإدارة", callback_data="user_message"),
+        InlineKeyboardButton("✅ تسجيل حضور", callback_data="user_attendance"),
+        InlineKeyboardButton("📝 طلب نشر مقال", callback_data="user_article"),
+        InlineKeyboardButton("✏️ تعديل بياناتي", callback_data="user_update"),
+        InlineKeyboardButton("📋 طلباتي", callback_data="user_my_requests"),
+        InlineKeyboardButton("🚪 التخلي عن العضوية", callback_data="user_resign")
+    ]
+    
+    if role == 'volunteer':
+        buttons.insert(4, InlineKeyboardButton("⚡ مهامي", callback_data="volunteer_tasks"))
+        buttons.insert(5, InlineKeyboardButton("📊 تقريري", callback_data="volunteer_report"))
+    
+    markup.add(*buttons)
+    cell_info = get_cell_display(member)
+    bot.send_message(chat_id, f"👋 أهلاً *{member.get('fullName')}!*\n🏷️ الصفة: {'منخرط' if member.get('type')=='عضو' else 'متطوع'}\n📌 {cell_info}\n\nاختر الخدمة:", parse_mode='Markdown', reply_markup=markup)
 
-# ------------------- أوامر البوت الرئيسية -------------------
+# ========== أوامر البداية والدخول ==========
 @bot.message_handler(commands=['start'])
-def send_welcome(message):
+def start(message):
     chat_id = message.chat.id
-    user_sessions.pop(chat_id, None)
     c.execute("DELETE FROM sessions WHERE chat_id=?", (chat_id,))
     conn.commit()
-    bot.send_message(chat_id, "مرحباً بك في *المنتدى الشبابي للفكر والمشاركة المدنية - نزاهة*.\n\nللحصول على الخدمات، يُرجى تسجيل الدخول باستخدام الأمر /login\n\nإذا كنت أدمن، استخدم /admin", parse_mode='Markdown')
+    
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    markup.add(KeyboardButton("/login"), KeyboardButton("/admin"), KeyboardButton("/help"))
+    
+    bot.send_message(chat_id, 
+        "🏛️ *مرحباً في نظام نزاهة*\n"
+        "المنتدى الشبابي للفكر والمشاركة المدنية\n\n"
+        "🔑 *للأعضاء:* `/login`\n"
+        "👑 *للأدمن:* `/admin`\n"
+        "❓ *المساعدة:* `/help`\n\n"
+        "📌 الدخول يتطلب رقم التعريف + كلمة المرور",
+        parse_mode='Markdown', reply_markup=markup)
+
+@bot.message_handler(commands=['help'])
+def help_cmd(message):
+    chat_id = message.chat.id
+    help_text = """
+📖 *دليل استخدام بوت نزاهة*
+
+*🔑 أوامر الدخول:*
+`/login` - تسجيل الدخول كعضو/متطوع
+`/admin` - دخول لوحة الأدمن
+`/logout` - تسجيل الخروج
+
+*🔍 أوامر البحث:*
+`/search [رقم أو اسم]` - البحث السريع
+`/cells` - عرض الخلايا والأقسام
+
+*📊 أوامر المعلومات:*
+`/about` - عن النظام
+`/stats` - إحصائيات عامة
+
+*💡 نصائح:*
+• احفظ كلمة المرور في مكان آمن
+• يمكنك مراسلة الإدارة في أي وقت
+• سجل حضورك يومياً للحصول على نشاط
+    """
+    bot.send_message(chat_id, help_text, parse_mode='Markdown')
+
+@bot.message_handler(commands=['about'])
+def about_cmd(message):
+    chat_id = message.chat.id
+    members = get_members()
+    volunteers = len([m for m in members if m.get('type') == 'موظف'])
+    regular = len([m for m in members if m.get('type') == 'عضو'])
+    cells = len(get_all_cells())
+    
+    about_text = f"""
+🏛️ *عن نظام نزاهة*
+
+المنتدى الشبابي للفكر والمشاركة المدنية
+
+📊 *إحصائيات المنظمة:*
+👥 إجمالي الأعضاء: {len(members)}
+🔵 متطوعين: {volunteers}
+🟢 منخرطين: {regular}
+🏛️ عدد الخلايا: {cells}
+
+🤖 *مميزات النظام:*
+✅ تسجيل الحضور اليومي
+✅ مراسلة الإدارة
+✅ طلب نشر المقالات
+✅ متابعة المهام (للمتطوعين)
+✅ تقارير وإحصائيات
+
+📅 *تاريخ التحديث:* {datetime.datetime.now().strftime('%Y-%m-%d')}
+    """
+    bot.send_message(chat_id, about_text, parse_mode='Markdown')
+
+@bot.message_handler(commands=['stats'])
+def stats_cmd(message):
+    chat_id = message.chat.id
+    members = get_members()
+    volunteers = len([m for m in members if m.get('type') == 'موظف'])
+    regular = len([m for m in members if m.get('type') == 'عضو'])
+    no_cell = len(get_members_without_cell())
+    cells = get_all_cells()
+    
+    text = f"""
+📊 *إحصائيات نظام نزاهة*
+
+👥 *الأعضاء:*
+├ 🔵 متطوعين: {volunteers}
+├ 🟢 منخرطين: {regular}
+└ 📌 بدون خلية: {no_cell}
+
+🏛️ *الخلايا النشطة:* {len(cells)}
+"""
+    for cell in cells[:10]:
+        count = len(get_members_by_cell(cell))
+        text += f"• {cell}: {count} عضو\n"
+    
+    today = datetime.date.today().isoformat()
+    attendance = c.execute("SELECT COUNT(DISTINCT user_id) FROM attendance WHERE date=?", (today,)).fetchone()[0]
+    text += f"\n✅ *الحضور اليوم:* {attendance} عضو"
+    
+    bot.send_message(chat_id, text, parse_mode='Markdown')
+
+@bot.message_handler(commands=['cells'])
+def cells_cmd(message):
+    chat_id = message.chat.id
+    cells = get_all_cells()
+    no_cell_members = get_members_without_cell()
+    
+    text = "🏛️ *الخلايا والأقسام*\n\n"
+    for cell in cells:
+        count = len(get_members_by_cell(cell))
+        text += f"📌 *{cell}*\n└ 👥 {count} عضو\n\n"
+    
+    if no_cell_members:
+        text += f"📌 *منخرطين عامين (بدون خلية)*\n└ 👥 {len(no_cell_members)} عضو\n\n"
+    
+    text += "💡 استخدم `/search [اسم الخلية]` للبحث"
+    bot.send_message(chat_id, text, parse_mode='Markdown')
 
 @bot.message_handler(commands=['admin'])
-def admin_login_prompt(message):
+def admin_login(message):
     chat_id = message.chat.id
-    msg = bot.send_message(chat_id, "أدخل كلمة مرور الأدمن:")
-    bot.register_next_step_handler(msg, admin_login_check)
+    msg = bot.send_message(chat_id, "🔐 *أدخل كلمة مرور الأدمن:*", parse_mode='Markdown')
+    bot.register_next_step_handler(msg, check_admin_password)
 
-def admin_login_check(message):
+def check_admin_password(message):
     chat_id = message.chat.id
-    if message.text.strip() == ADMIN_PASSWORD:
-        # تسجيل الدخول كأدمن
-        c.execute("REPLACE INTO sessions (chat_id, user_id, full_name, role, status) VALUES (?, ?, ?, ?, ?)",
-                  (chat_id, 'ADMIN', 'مدير النظام', 'admin', 'active'))
+    if message.text == ADMIN_PASSWORD:
+        c.execute("REPLACE INTO sessions (chat_id, user_id, full_name, role, login_time) VALUES (?, ?, ?, ?, ?)",
+                  (chat_id, 'ADMIN', 'مدير النظام', 'admin', datetime.datetime.now().isoformat()))
         conn.commit()
-        user_sessions[chat_id] = 'ADMIN'
-        bot.send_message(chat_id, "✅ تم تسجيل الدخول بنجاح كأدمن.")
-        admin_main_menu(chat_id)
+        log_activity('ADMIN', 'admin_login', f'chat_id: {chat_id}')
+        bot.send_message(chat_id, "✅ *تم الدخول كأدمن بنجاح*\n\n🛡️ لوحة التحكم جاهزة", parse_mode='Markdown')
+        admin_menu(chat_id)
     else:
-        bot.send_message(chat_id, "❌ كلمة المرور غير صحيحة. استخدم /admin للمحاولة مجدداً.")
+        bot.send_message(chat_id, "❌ *كلمة المرور خاطئة*\nاستخدم /admin للمحاولة مجدداً", parse_mode='Markdown')
 
 @bot.message_handler(commands=['login'])
 def login_step1(message):
     chat_id = message.chat.id
-    msg = bot.send_message(chat_id, "أدخل *رقم التعريف* الخاص بك (الرقم الموجود في بطاقتك):", parse_mode='Markdown')
+    msg = bot.send_message(chat_id, "🔑 *أدخل رقم التعريف:*", parse_mode='Markdown')
     bot.register_next_step_handler(msg, login_step2)
 
 def login_step2(message):
     chat_id = message.chat.id
     user_id = message.text.strip()
-    # نتحقق من وجود الرقم في JSON
     member = get_member_by_id(user_id)
+    
     if not member:
-        bot.send_message(chat_id, "❌ رقم التعريف غير موجود. تأكد من الرقم ثم أعد المحاولة باستخدام /login")
+        bot.send_message(chat_id, "❌ *رقم التعريف غير موجود*\nتأكد من الرقم وأعد المحاولة باستخدام /login", parse_mode='Markdown')
         return
-    msg = bot.send_message(chat_id, "أدخل *كلمة المرور* الخاصة بك:", parse_mode='Markdown')
-    bot.register_next_step_handler(msg, lambda m: login_step3(m, user_id, member))
+    
+    c.execute("INSERT OR REPLACE INTO sessions (chat_id, user_id, full_name, role, login_time) VALUES (?, ?, ?, ?, ?)",
+              (chat_id, user_id, member.get('fullName'), 'temp', datetime.datetime.now().isoformat()))
+    conn.commit()
+    
+    msg = bot.send_message(chat_id, f"🔐 *أدخل كلمة المرور للعضو {member.get('fullName')}:*", parse_mode='Markdown')
+    bot.register_next_step_handler(msg, login_step3, user_id)
 
-def login_step3(message, user_id, member):
+def login_step3(message, user_id):
     chat_id = message.chat.id
     password = message.text.strip()
-    # مقارنة كلمة المرور من JSON (يفترض وجود حقل 'password')
-    if member.get('password') != password:
-        bot.send_message(chat_id, "❌ كلمة المرور غير صحيحة. استخدم /login للمحاولة مجدداً.")
-        return
-    # تسجيل الجلسة
-    role = get_user_role_from_json(user_id)  # 'member' أو 'volunteer'
-    c.execute("REPLACE INTO sessions (chat_id, user_id, full_name, role, status) VALUES (?, ?, ?, ?, ?)",
-              (chat_id, user_id, member.get('fullName'), role, 'active'))
-    conn.commit()
-    user_sessions[chat_id] = user_id
-    bot.send_message(chat_id, f"✅ مرحباً {member.get('fullName')}، لقد تم تسجيل دخولك بنجاح.")
-    # عرض القائمة المناسبة
-    user_main_menu(chat_id, member)
-
-# ------------------- معالجة أزرار العضو/المتطوع -------------------
-@bot.callback_query_handler(func=lambda call: call.data.startswith("user_") or call.data.startswith("volunteer_"))
-def user_callbacks(call):
-    chat_id = call.message.chat.id
-    user_id = user_sessions.get(chat_id)
-    if not user_id or is_admin_mode(chat_id):
-        bot.answer_callback_query(call.id, "يرجى تسجيل الدخول أولاً باستخدام /login", show_alert=True)
-        return
-    member = get_member_by_id(user_id)
-    if not member:
-        bot.answer_callback_query(call.id, "بياناتك غير موجودة، يرجى التواصل مع الإدارة", show_alert=True)
-        return
-
-    data = call.data
-    if data == "user_profile":
-        # إرسال صورة البطاقة مع البيانات
-        card_img = generate_member_card(member)
-        caption = f"*بطاقة العضوية*\nالاسم: {member.get('fullName')}\nالنوع: {member.get('type', 'عضو')}\nرقم العضوية: {member.get('id')}\nالخلية: {member.get('cell', '-')}\nالمنصب: {member.get('position', '-')}\nتاريخ الانتهاء: {member.get('expiryDate', 'غير محدد')}"
-        bot.send_photo(chat_id, card_img, caption=caption, parse_mode='Markdown')
-        bot.answer_callback_query(call.id)
-
-    elif data == "user_send_message":
-        msg = bot.send_message(chat_id, "✏️ أدخل *عنوان* الرسالة:")
-        bot.register_next_step_handler(msg, process_message_subject, member)
-
-    elif data == "user_attendance_self":
-        # تسجيل حضور ذاتي
-        today = datetime.date.today().isoformat()
-        now_time = datetime.datetime.now().strftime("%H:%M")
-        c.execute("INSERT INTO attendance (user_id, full_name, date, time) VALUES (?, ?, ?, ?)",
-                  (member.get('id'), member.get('fullName'), today, now_time))
-        conn.commit()
-        bot.answer_callback_query(call.id, "تم تسجيل حضورك بنجاح ✅", show_alert=True)
-        bot.send_message(chat_id, f"شكراً لك {member.get('fullName')}، تم تسجيل حضورك اليوم {today} الساعة {now_time}.")
-
-    elif data == "user_idea":
-        msg = bot.send_message(chat_id, "💡 شاركنا فكرتك أو مبادرتك المقترحة (نص حر):")
-        bot.register_next_step_handler(msg, save_idea_request, member)
-
-    elif data == "user_donate":
-        msg = bot.send_message(chat_id, "🤝 كم ترغب في التبرع؟ (أدخل المبلغ بالدينار الجزائري):")
-        bot.register_next_step_handler(msg, save_donation_request, member)
-
-    elif data == "user_renew":
-        # إرسال طلب تجديد للإدارة
-        c.execute("INSERT INTO requests (from_user_id, from_name, request_type, details, date) VALUES (?, ?, ?, ?, ?)",
-                  (member.get('id'), member.get('fullName'), 'تجديد العهدة', f"طلب تجديد العهدة المنتهية في {member.get('expiryDate')}", datetime.datetime.now().isoformat()))
-        conn.commit()
-        bot.answer_callback_query(call.id, "تم إرسال طلب تجديد العهدة إلى الإدارة.", show_alert=True)
-
-    elif data == "user_update_data":
-        msg = bot.send_message(chat_id, "أرسل البيانات الجديدة التي تريد تعديلها (مثال: الهاتف القديم/الجديد، العنوان، البريد الإلكتروني):")
-        bot.register_next_step_handler(msg, save_update_request, member)
-
-    elif data == "user_request_cert":
-        msg = bot.send_message(chat_id, "أدخل سبب طلب الشهادة (مثلاً: شهادة تقدير لمشاركتك في ورشة العمل):")
-        bot.register_next_step_handler(msg, save_cert_request, member)
-
-    elif data == "user_request_letter":
-        msg = bot.send_message(chat_id, "أدخل الجهة المراد إرسال الخطاب إليها وسبب الطلب:")
-        bot.register_next_step_handler(msg, save_letter_request, member)
-
-    elif data == "volunteer_tasks":
-        # عرض المهام الموكلة للمتطوع (يمكن توسيعها حسب قاعدة بيانات)
-        bot.send_message(chat_id, "📋 قائمة مهامك الحالية:\n- متابعة ملفات الأعضاء الجدد\n- تجهيز تقرير النشاط الأسبوعي\nيمكنك إضافة مهام جديدة عن طريق إرسال طلب للإدارة.")
-
-def process_message_subject(message, member):
-    subject = message.text
-    msg = bot.send_message(message.chat.id, "أدخل *نص* الرسالة:")
-    bot.register_next_step_handler(msg, lambda m: save_message(m, member, subject))
-
-def save_message(message, member, subject):
-    body = message.text
-    c.execute("INSERT INTO messages (from_user_id, from_name, to_user_id, subject, body, date, is_read) VALUES (?, ?, ?, ?, ?, ?, ?)",
-              (member.get('id'), member.get('fullName'), 'ADMIN', subject, body, datetime.datetime.now().isoformat(), 0))
-    conn.commit()
-    bot.send_message(message.chat.id, "✅ تم إرسال رسالتك إلى الإدارة. ستتلقى رداً عند مراجعة الأدمن.")
-
-def save_idea_request(message, member):
-    idea = message.text
-    c.execute("INSERT INTO requests (from_user_id, from_name, request_type, details, date) VALUES (?, ?, ?, ?, ?)",
-              (member.get('id'), member.get('fullName'), 'مبادرة مقترحة', idea, datetime.datetime.now().isoformat()))
-    conn.commit()
-    bot.send_message(message.chat.id, "شكراً لمقترحك. سيتم دراسته من قبل الإدارة.")
-
-def save_donation_request(message, member):
-    amount = message.text
-    c.execute("INSERT INTO requests (from_user_id, from_name, request_type, details, date) VALUES (?, ?, ?, ?, ?)",
-              (member.get('id'), member.get('fullName'), 'تبرع', f"مبلغ {amount} دج", datetime.datetime.now().isoformat()))
-    conn.commit()
-    bot.send_message(message.chat.id, "جزيل الشكر على تبرعك. سيتم التواصل معك لتأكيد البيانات.")
-
-def save_update_request(message, member):
-    details = message.text
-    c.execute("INSERT INTO requests (from_user_id, from_name, request_type, details, date) VALUES (?, ?, ?, ?, ?)",
-              (member.get('id'), member.get('fullName'), 'تعديل بيانات', details, datetime.datetime.now().isoformat()))
-    conn.commit()
-    bot.send_message(message.chat.id, "تم تسجيل طلب تعديل البيانات. سيتم المراجعة.")
-
-def save_cert_request(message, member):
-    reason = message.text
-    c.execute("INSERT INTO requests (from_user_id, from_name, request_type, details, date) VALUES (?, ?, ?, ?, ?)",
-              (member.get('id'), member.get('fullName'), 'شهادة تقدير', reason, datetime.datetime.now().isoformat()))
-    conn.commit()
-    bot.send_message(message.chat.id, "تم طلب شهادة تقدير. ستتلقى رداً من الإدارة قريباً.")
-
-def save_letter_request(message, member):
-    details = message.text
-    c.execute("INSERT INTO requests (from_user_id, from_name, request_type, details, date) VALUES (?, ?, ?, ?, ?)",
-              (member.get('id'), member.get('fullName'), 'خطاب رسمي', details, datetime.datetime.now().isoformat()))
-    conn.commit()
-    bot.send_message(message.chat.id, "تم طلب خطاب رسمي. سيتم الرد عليك.")
-
-# ------------------- معالجة أزرار الأدمن -------------------
-@bot.callback_query_handler(func=lambda call: call.data.startswith("admin_"))
-def admin_callbacks(call):
-    chat_id = call.message.chat.id
-    if not is_admin_mode(chat_id):
-        bot.answer_callback_query(call.id, "ليس لديك صلاحية", show_alert=True)
-        return
-    data = call.data
-    if data == "admin_members":
-        show_all_members(chat_id)
-    elif data == "admin_add_user":
-        add_user_start(call)
-    elif data == "admin_inbox":
-        show_inbox(chat_id)
-    elif data == "admin_stats":
-        show_stats(chat_id)
-    elif data == "admin_certs":
-        show_certificates(chat_id)
-    elif data == "admin_letters":
-        show_letters(chat_id)
-    elif data == "admin_reports":
-        show_reports(chat_id)
-    elif data == "admin_attendance":
-        show_attendance_menu(chat_id)
-    elif data == "admin_broadcast":
-        msg = bot.send_message(chat_id, "أدخل نص الإشعار الجماعي الذي تريد إرساله لجميع الأعضاء المسجلين:")
-        bot.register_next_step_handler(msg, broadcast_message)
-    elif data == "admin_initiatives":
-        show_initiatives(chat_id)
-    elif data == "admin_activities":
-        show_activities(chat_id)
-    elif data == "admin_requests":
-        show_requests(chat_id)
-    elif data == "admin_logout":
+    
+    success, member = check_login(user_id, password)
+    
+    if not success:
+        bot.send_message(chat_id, "❌ *كلمة المرور غير صحيحة*\nاستخدم /login للمحاولة مجدداً", parse_mode='Markdown')
         c.execute("DELETE FROM sessions WHERE chat_id=?", (chat_id,))
         conn.commit()
-        user_sessions.pop(chat_id, None)
-        bot.send_message(chat_id, "تم تسجيل الخروج من وضع الإدارة. استخدم /login أو /admin للدخول مجدداً.")
-
-def show_all_members(chat_id):
-    members = get_members_from_json()
-    if not members:
-        bot.send_message(chat_id, "لا توجد بيانات أعضاء حالياً.")
         return
-    text = "📋 *قائمة الأعضاء والمتطوعين*\n\n"
-    for m in members:
-        role = "متطوع" if (m.get('type') == 'موظف' or m.get('cadreType') == 'موظف') else "عضو"
-        text += f"• {m.get('fullName')} ({role}) - رقم: {m.get('id')}\n"
-    bot.send_message(chat_id, text, parse_mode='Markdown')
-
-def add_user_start(call):
-    chat_id = call.message.chat.id
-    msg = bot.send_message(chat_id, "أدخل نوع المستخدم (عضو / متطوع):")
-    bot.register_next_step_handler(msg, add_user_type)
-
-def add_user_type(message):
-    user_type = message.text.strip()
-    if user_type not in ['عضو', 'متطوع']:
-        bot.send_message(message.chat.id, "نوع غير صحيح. أعد المحاولة باستخدام /admin ثم اختر إضافة مستخدم")
-        return
-    msg = bot.send_message(message.chat.id, "أدخل الاسم الكامل:")
-    bot.register_next_step_handler(msg, add_user_name, user_type)
-
-def add_user_name(message, user_type):
-    full_name = message.text
-    msg = bot.send_message(message.chat.id, "أدخل رقم الهاتف (اختياري):")
-    bot.register_next_step_handler(msg, add_user_phone, user_type, full_name)
-
-def add_user_phone(message, user_type, full_name):
-    phone = message.text
-    msg = bot.send_message(message.chat.id, "أدخل تاريخ الانتهاء (مثال: 2026-12-31) أو اكتب 'بدون':")
-    bot.register_next_step_handler(msg, add_user_expiry, user_type, full_name, phone)
-
-def add_user_expiry(message, user_type, full_name, phone):
-    expiry = message.text if message.text != 'بدون' else ''
-    # توليد رقم تعريف فريد
-    new_id = f"NZ{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}"
-    # إضافة إلى قاعدة البيانات المحلية فقط (نحتفظ بها للمزامنة لاحقاً، لكن JSON خارجي)
-    # ننشئ سجل عضو في جدول sessions (للسماح بدخوله لاحقاً) ونضيفه أيضاً إلى ملف JSON؟ نكتفي بقاعدة البيانات المحلية للجلسات
-    c.execute("INSERT INTO sessions (chat_id, user_id, full_name, role, status) VALUES (?, ?, ?, ?, ?)",
-              (0, new_id, full_name, ('volunteer' if user_type=='متطوع' else 'member'), 'active'))
+    
+    role = get_user_role(member)
+    c.execute("REPLACE INTO sessions (chat_id, user_id, full_name, role, login_time) VALUES (?, ?, ?, ?, ?)",
+              (chat_id, user_id, member.get('fullName'), role, datetime.datetime.now().isoformat()))
     conn.commit()
-    # نضيف أيضاً طلب إضافة إلى JSON؟ يمكن إضافة طلب للإدارة ليتم رفعه يدوياً.
-    bot.send_message(message.chat.id, f"✅ تم إضافة {user_type}:\nالاسم: {full_name}\nالرقم: {new_id}\nكلمة المرور مؤقتة: 123456\n(يجب إضافة هذه البيانات إلى ملف JSON يدوياً لتفعيل الدخول الكامل)")
+    
+    log_activity(user_id, 'login', f"{member.get('fullName')} - {member.get('type')}")
+    
+    cell_info = get_cell_display(member)
+    welcome_text = f"""✅ *مرحباً {member.get('fullName')}!*
 
-def show_inbox(chat_id):
-    msgs = c.execute("SELECT id, from_user_id, from_name, subject, date, is_read FROM messages WHERE to_user_id='ADMIN' ORDER BY id DESC").fetchall()
-    if not msgs:
-        bot.send_message(chat_id, "📭 لا توجد رسائل حالياً.")
-        return
-    for m in msgs:
-        read_status = "✅ مقروءة" if m[5] else "🆕 جديدة"
-        markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("📖 عرض الرسالة والرد", callback_data=f"admin_view_msg_{m[0]}"))
-        bot.send_message(chat_id, f"*من:* {m[2]} ({m[1]})\n*الموضوع:* {m[3]}\n*التاريخ:* {m[4]}\n*الحالة:* {read_status}", parse_mode='Markdown', reply_markup=markup)
-        if not m[5]:
-            c.execute("UPDATE messages SET is_read=1 WHERE id=?", (m[0],))
-            conn.commit()
+🏷️ *الصفة:* {'منخرط' if member.get('type')=='عضو' else 'متطوع'}
+📌 *الخلية:* {cell_info}
+💼 *المنصب:* {get_position_display(member)}
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("admin_view_msg_"))
-def view_message_details(call):
-    msg_id = int(call.data.split("_")[3])
-    msg = c.execute("SELECT from_user_id, from_name, subject, body, date FROM messages WHERE id=?", (msg_id,)).fetchone()
-    if not msg:
-        bot.answer_callback_query(call.id, "الرسالة غير موجودة")
-        return
-    text = f"*من:* {msg[1]} ({msg[0]})\n*الموضوع:* {msg[2]}\n*التاريخ:* {msg[4]}\n\n*النص:*\n{msg[3]}"
-    markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton("✉️ رد على هذه الرسالة", callback_data=f"admin_reply_{msg_id}_{msg[0]}_{msg[1]}"))
-    bot.send_message(call.message.chat.id, text, parse_mode='Markdown', reply_markup=markup)
+تم تسجيل الدخول بنجاح 🎉"""
+    
+    bot.send_message(chat_id, welcome_text, parse_mode='Markdown')
+    user_menu(chat_id, member)
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("admin_reply_"))
-def reply_to_message(call):
-    parts = call.data.split("_")
-    original_msg_id = int(parts[2])
-    to_user_id = parts[3]
-    to_name = parts[4]
-    msg = bot.send_message(call.message.chat.id, f"أكتب ردك على العضو {to_name} ({to_user_id}):")
-    bot.register_next_step_handler(msg, send_reply_to_member, original_msg_id, to_user_id, to_name)
-
-def send_reply_to_member(message, original_msg_id, to_user_id, to_name):
-    reply_body = message.text
-    c.execute("INSERT INTO messages (from_user_id, from_name, to_user_id, subject, body, date, reply_to) VALUES (?, ?, ?, ?, ?, ?, ?)",
-              ('ADMIN', 'مدير النظام', to_user_id, f"رد على رسالتك", reply_body, datetime.datetime.now().isoformat(), original_msg_id))
-    conn.commit()
-    bot.send_message(message.chat.id, "✅ تم إرسال الرد.")
-    # محاولة إرسال الرد للمستخدم الأصلي إذا كان لديه جلسة مفتوحة
-    # نبحث عن chat_id الخاص به
-    user_chat = c.execute("SELECT chat_id FROM sessions WHERE user_id=?", (to_user_id,)).fetchone()
-    if user_chat:
-        try:
-            bot.send_message(user_chat[0], f"📩 *لديك رد جديد من الإدارة*\n\n{reply_body}", parse_mode='Markdown')
-        except:
-            pass
-
-def show_stats(chat_id):
-    total_members = len(get_members_from_json())
-    total_msgs = c.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
-    total_attendance = c.execute("SELECT COUNT(*) FROM attendance").fetchone()[0]
-    total_requests = c.execute("SELECT COUNT(*) FROM requests").fetchone()[0]
-    text = f"📊 *إحصائيات منصة نزاهة*\n\n👥 عدد الأعضاء المسجلين: {total_members}\n📨 عدد الرسائل المتبادلة: {total_msgs}\n✅ عدد تسجيلات الحضور: {total_attendance}\n📋 عدد الطلبات المقدمة: {total_requests}"
-    bot.send_message(chat_id, text, parse_mode='Markdown')
-
-def show_certificates(chat_id):
-    certs = c.execute("SELECT id, full_name, title, date FROM certificates ORDER BY id DESC").fetchall()
-    if not certs:
-        bot.send_message(chat_id, "لا توجد شهادات بعد.")
-        return
-    text = "📜 *قائمة الشهادات الصادرة*\n\n"
-    for cert in certs:
-        text += f"#{cert[0]} - {cert[1]} : {cert[2]} (تاريخ {cert[3]})\n"
-    bot.send_message(chat_id, text, parse_mode='Markdown')
-
-def show_letters(chat_id):
-    letters = c.execute("SELECT id, to_whom, subject, date FROM letters ORDER BY id DESC").fetchall()
-    if not letters:
-        bot.send_message(chat_id, "لا توجد خطابات مسجلة.")
-        return
-    text = "✉️ *الخطابات الرسمية*\n\n"
-    for l in letters:
-        text += f"#{l[0]} - إلى: {l[1]} ، الموضوع: {l[2]} (تاريخ {l[3]})\n"
-    bot.send_message(chat_id, text, parse_mode='Markdown')
-
-def show_reports(chat_id):
-    reports = c.execute("SELECT id, title, type, date FROM reports ORDER BY id DESC").fetchall()
-    if not reports:
-        bot.send_message(chat_id, "لا توجد تقارير مسجلة.")
-        return
-    text = "📄 *التقارير الصادرة*\n\n"
-    for r in reports:
-        text += f"#{r[0]} - {r[1]} ({r[2]}) - تاريخ {r[3]}\n"
-    bot.send_message(chat_id, text, parse_mode='Markdown')
-
-def show_attendance_menu(chat_id):
-    markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton("تسجيل حضور يدوي (برقم العضوية)", callback_data="admin_attendance_manual"))
-    markup.add(InlineKeyboardButton("عرض سجل الحضور اليومي", callback_data="admin_view_attendance"))
-    bot.send_message(chat_id, "اختر خدمة الحضور:", reply_markup=markup)
-
-@bot.callback_query_handler(func=lambda call: call.data == "admin_attendance_manual")
-def manual_attendance(call):
-    msg = bot.send_message(call.message.chat.id, "أدخل رقم العضوية للعضو الذي تريد تسجيل حضوره:")
-    bot.register_next_step_handler(msg, manual_attendance_record)
-
-def manual_attendance_record(message):
-    user_id = message.text.strip()
-    member = get_member_by_id(user_id)
-    if not member:
-        bot.send_message(message.chat.id, "❌ رقم العضوية غير موجود.")
-        return
-    today = datetime.date.today().isoformat()
-    now_time = datetime.datetime.now().strftime("%H:%M")
-    c.execute("INSERT INTO attendance (user_id, full_name, date, time) VALUES (?, ?, ?, ?)",
-              (user_id, member.get('fullName'), today, now_time))
-    conn.commit()
-    bot.send_message(message.chat.id, f"✅ تم تسجيل حضور {member.get('fullName')} بنجاح.")
-
-@bot.callback_query_handler(func=lambda call: call.data == "admin_view_attendance")
-def view_attendance(call):
-    today = datetime.date.today().isoformat()
-    records = c.execute("SELECT full_name, time FROM attendance WHERE date=? ORDER BY time DESC", (today,)).fetchall()
-    if not records:
-        bot.send_message(call.message.chat.id, f"لا يوجد حضور مسجل لليوم {today}.")
-        return
-    text = f"✅ *سجل الحضور ليوم {today}*\n\n"
-    for r in records:
-        text += f"• {r[0]} - الساعة {r[1]}\n"
-    bot.send_message(call.message.chat.id, text, parse_mode='Markdown')
-
-def broadcast_message(message):
+@bot.message_handler(commands=['logout'])
+def logout(message):
     chat_id = message.chat.id
-    text = message.text
-    # الحصول على جميع المستخدمين المسجلين في الجلسات (الذين دخلوا مرة واحدة)
-    users = c.execute("SELECT chat_id FROM sessions WHERE role != 'admin'").fetchall()
+    session = c.execute("SELECT user_id FROM sessions WHERE chat_id=?", (chat_id,)).fetchone()
+    if session:
+        log_activity(session[0], 'logout')
+    c.execute("DELETE FROM sessions WHERE chat_id=?", (chat_id,))
+    conn.commit()
+    bot.send_message(chat_id, "👋 *تم تسجيل الخروج بنجاح*\nاستخدم /login للدخول مجدداً", parse_mode='Markdown')
+
+# ========== أوامر البحث السريع ==========
+@bot.message_handler(func=lambda m: m.text and m.text.startswith('/search'))
+def quick_search(message):
+    chat_id = message.chat.id
+    keyword = message.text.replace('/search', '').strip()
+    
+    if not keyword:
+        bot.send_message(chat_id, "🔍 *أرسل رقم التعريف أو الاسم بعد الأمر*\nمثال: `/search 1270738` أو `/search نزيه`", parse_mode='Markdown')
+        return
+    
+    # البحث برقم التعريف أولاً
+    member = get_member_by_id(keyword)
+    if not member:
+        member = get_member_by_name(keyword)
+    
+    # البحث حسب الخلية
+    if not member:
+        cell_members = get_members_by_cell(keyword)
+        if cell_members:
+            text = f"🏛️ *أعضاء خلية: {keyword}*\n\n"
+            for m in cell_members[:20]:
+                text += f"• `{m.get('id')}` - {m.get('fullName')} ({'متطوع' if m.get('type')=='موظف' else 'منخرط'})\n"
+            bot.send_message(chat_id, text, parse_mode='Markdown')
+            return
+    
+    if member:
+        bot.send_message(chat_id, format_member_info(member), parse_mode='Markdown')
+    else:
+        bot.send_message(chat_id, "❌ *لم يتم العثور على عضو أو خلية بهذا الاسم/الرقم*", parse_mode='Markdown')
+
+# ========== معالجة الكولباك (جميع الميزات) ==========
+@bot.callback_query_handler(func=lambda call: True)
+def handle_callbacks(call):
+    chat_id = call.message.chat.id
+    session = c.execute("SELECT user_id, full_name, role FROM sessions WHERE chat_id=?", (chat_id,)).fetchone()
+    
+    if not session and not call.data.startswith(('admin_search', 'admin_logout')):
+        bot.answer_callback_query(call.id, "الرجاء تسجيل الدخول أولاً", show_alert=True)
+        return
+    
+    data = call.data
+    
+    # ========== أوامر الأدمن ==========
+    if data == "admin_search":
+        bot.answer_callback_query(call.id)
+        msg = bot.send_message(chat_id, "🔍 *أدخل رقم التعريف أو الاسم للبحث:*", parse_mode='Markdown')
+        bot.register_next_step_handler(msg, admin_search_member)
+    
+    elif data == "admin_members":
+        bot.answer_callback_query(call.id)
+        show_members_filter(chat_id)
+    
+    elif data == "admin_cells":
+        bot.answer_callback_query(call.id)
+        show_cells_menu(chat_id)
+    
+    elif data == "admin_requests":
+        bot.answer_callback_query(call.id)
+        show_requests_admin(chat_id)
+    
+    elif data == "admin_messages":
+        bot.answer_callback_query(call.id)
+        show_messages_admin(chat_id)
+    
+    elif data == "admin_attendance":
+        bot.answer_callback_query(call.id)
+        show_attendance_admin(chat_id)
+    
+    elif data == "admin_stats":
+        bot.answer_callback_query(call.id)
+        show_detailed_stats(chat_id)
+    
+    elif data == "admin_broadcast":
+        bot.answer_callback_query(call.id)
+        msg = bot.send_message(chat_id, "📢 *أدخل نص الإشعار لجميع المستخدمين:*", parse_mode='Markdown')
+        bot.register_next_step_handler(msg, send_broadcast)
+    
+    elif data == "admin_tasks":
+        bot.answer_callback_query(call.id)
+        show_tasks_menu(chat_id)
+    
+    elif data == "admin_backup":
+        bot.answer_callback_query(call.id)
+        path = backup_database()
+        if path:
+            bot.send_message(chat_id, f"✅ *تم إنشاء نسخة احتياطية*\n📁 `{path}`", parse_mode='Markdown')
+        else:
+            bot.send_message(chat_id, "❌ *فشل إنشاء النسخة الاحتياطية*", parse_mode='Markdown')
+        admin_menu(chat_id)
+    
+    elif data == "admin_logs":
+        bot.answer_callback_query(call.id)
+        show_activity_logs(chat_id)
+    
+    elif data == "admin_logout":
+        bot.answer_callback_query(call.id)
+        c.execute("DELETE FROM sessions WHERE chat_id=?", (chat_id,))
+        conn.commit()
+        bot.send_message(chat_id, "👋 *تم تسجيل الخروج من وضع الأدمن*", parse_mode='Markdown')
+    
+    # ========== أوامر المستخدم ==========
+    elif data == "user_profile":
+        if session:
+            member = get_member_by_id(session[0])
+            if member:
+                bot.send_message(chat_id, format_member_info(member), parse_mode='Markdown')
+            else:
+                bot.send_message(chat_id, "❌ لم يتم العثور على بياناتك", parse_mode='Markdown')
+        bot.answer_callback_query(call.id)
+    
+    elif data == "user_search":
+        bot.answer_callback_query(call.id)
+        msg = bot.send_message(chat_id, "🔍 *أدخل رقم التعريف أو الاسم للبحث:*", parse_mode='Markdown')
+        bot.register_next_step_handler(msg, user_search_member)
+    
+    elif data == "user_message":
+        if session:
+            msg = bot.send_message(chat_id, "📨 *اكتب رسالتك للإدارة:*", parse_mode='Markdown')
+            bot.register_next_step_handler(msg, save_user_message, session)
+        bot.answer_callback_query(call.id)
+    
+    elif data == "user_attendance":
+        if session:
+            today = datetime.date.today().isoformat()
+            now_time = datetime.datetime.now().strftime("%H:%M")
+            existing = c.execute("SELECT id FROM attendance WHERE user_id=? AND date=?", (session[0], today)).fetchone()
+            if existing:
+                bot.answer_callback_query(call.id, "❌ لقد سجلت حضورك اليوم مسبقاً", show_alert=True)
+                return
+            
+            c.execute("INSERT INTO attendance (user_id, user_name, date, time) VALUES (?, ?, ?, ?)",
+                      (session[0], session[1], today, now_time))
+            conn.commit()
+            log_activity(session[0], 'attendance', f"date: {today}, time: {now_time}")
+            bot.answer_callback_query(call.id, "✅ تم تسجيل حضورك بنجاح", show_alert=True)
+            bot.send_message(chat_id, f"✅ *شكراً {session[1]}*\n📅 تاريخ: {today}\n⏰ الساعة: {now_time}", parse_mode='Markdown')
+        else:
+            bot.answer_callback_query(call.id)
+    
+    elif data == "user_article":
+        if session:
+            msg = bot.send_message(chat_id, "✍️ *أرسل عنوان المقال:*", parse_mode='Markdown')
+            bot.register_next_step_handler(msg, get_article_title, session)
+        bot.answer_callback_query(call.id)
+    
+    elif data == "user_update":
+        if session:
+            msg = bot.send_message(chat_id, "✏️ *أرسل البيانات التي تريد تعديلها*\nمثال: أريد تغيير رقم هاتفي إلى 0555123456", parse_mode='Markdown')
+            bot.register_next_step_handler(msg, save_update_request, session)
+        bot.answer_callback_query(call.id)
+    
+    elif data == "user_my_requests":
+        if session:
+            show_user_requests(chat_id, session[0])
+        bot.answer_callback_query(call.id)
+    
+    elif data == "user_resign":
+        markup = InlineKeyboardMarkup()
+        markup.add(
+            InlineKeyboardButton("✅ نعم، أتأكد", callback_data="confirm_resign"),
+            InlineKeyboardButton("❌ لا، إلغاء", callback_data="cancel_resign")
+        )
+        bot.send_message(chat_id, "⚠️ *هل أنت متأكد من رغبتك في التخلي عن العضوية؟*\n\nهذا الإجراء نهائي ولا يمكن التراجع عنه. سيتم إرسال طلب للإدارة للموافقة.", parse_mode='Markdown', reply_markup=markup)
+        bot.answer_callback_query(call.id)
+    
+    elif data == "volunteer_tasks":
+        if session:
+            show_volunteer_tasks(chat_id, session[0])
+        bot.answer_callback_query(call.id)
+    
+    elif data == "volunteer_report":
+        if session:
+            generate_volunteer_report(chat_id, session[0], session[1])
+        bot.answer_callback_query(call.id)
+    
+    elif data == "confirm_resign":
+        if session:
+            req_number = generate_request_number()
+            c.execute("INSERT INTO requests (request_number, user_id, user_name, request_type, details, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                      (req_number, session[0], session[1], 'تخلي عن العضوية', 'طلب مغادرة المنتدى وإنهاء العضوية', datetime.datetime.now().isoformat()))
+            conn.commit()
+            
+            admin_text = f"⚠️ *طلب تخلي عن العضوية*\n\n📋 *رقم الطلب:* `{req_number}`\n👤 *العضو:* {session[1]}\n🆔 *الرقم:* `{session[0]}`"
+            send_notification_to_admin(admin_text, InlineKeyboardMarkup().add(InlineKeyboardButton("📋 عرض الطلب", callback_data=f"view_req_{req_number}")))
+            
+            bot.send_message(chat_id, "✅ *تم إرسال طلب التخلي عن العضوية إلى الإدارة*\nسيتم التواصل معك قريباً", parse_mode='Markdown')
+            log_activity(session[0], 'resign_request', req_number)
+        bot.answer_callback_query(call.id)
+    
+    elif data == "cancel_resign":
+        bot.answer_callback_query(call.id, "❌ تم إلغاء طلب التخلي عن العضوية", show_alert=True)
+    
+    # ========== عرض تفاصيل الطلب ==========
+    elif data.startswith("view_req_"):
+        req_id = data.split("_")[2]
+        show_request_detail(chat_id, req_id)
+        bot.answer_callback_query(call.id)
+    
+    elif data.startswith("done_req_"):
+        req_id = data.split("_")[2]
+        c.execute("UPDATE requests SET status='completed', handled_by=?, handled_at=? WHERE id=?", 
+                  (session[1] if session else 'ADMIN', datetime.datetime.now().isoformat(), req_id))
+        conn.commit()
+        bot.answer_callback_query(call.id, "✅ تم تحديث حالة الطلب إلى مكتمل", show_alert=True)
+        show_request_detail(chat_id, req_id)
+    
+    elif data.startswith("reply_msg_"):
+        msg_id = data.split("_")[2]
+        msg_data = c.execute("SELECT from_id, from_name, content FROM messages WHERE id=?", (msg_id,)).fetchone()
+        if msg_data:
+            bot.answer_callback_query(call.id)
+            msg = bot.send_message(chat_id, f"✉️ *الرد على {msg_data[1]}*\n\nالرسالة الأصلية: {msg_data[2][:100]}...\n\nأكتب ردك:", parse_mode='Markdown')
+            bot.register_next_step_handler(msg, send_reply, msg_data[0], msg_data[1])
+    
+    # ========== فلترة الأعضاء ==========
+    elif data.startswith("filter_type_"):
+        member_type = data.replace("filter_type_", "")
+        show_members_by_type(chat_id, member_type)
+        bot.answer_callback_query(call.id)
+    
+    elif data.startswith("filter_cell_"):
+        cell_name = data.replace("filter_cell_", "")
+        show_members_by_cell(chat_id, cell_name)
+        bot.answer_callback_query(call.id)
+    
+    elif data == "filter_no_cell":
+        show_members_no_cell(chat_id)
+        bot.answer_callback_query(call.id)
+    
+    elif data == "back_to_admin":
+        bot.answer_callback_query(call.id)
+        admin_menu(chat_id)
+    
+    # ========== مهام المتطوعين ==========
+    elif data.startswith("task_done_"):
+        task_id = data.split("_")[2]
+        c.execute("UPDATE tasks SET status='completed', completed_at=? WHERE id=?", 
+                  (datetime.datetime.now().isoformat(), task_id))
+        conn.commit()
+        bot.answer_callback_query(call.id, "✅ تم إكمال المهمة", show_alert=True)
+        if session:
+            show_volunteer_tasks(chat_id, session[0])
+    
+    elif data.startswith("admin_assign_task_"):
+        bot.answer_callback_query(call.id)
+        msg = bot.send_message(chat_id, "📝 *أدخل تفاصيل المهمة بالشكل:*\n`رقم_المتطوع|عنوان|وصف|أولوية (high/normal/low)|تاريخ_الاستحقاق`", parse_mode='Markdown')
+        bot.register_next_step_handler(msg, assign_task_admin)
+
+# ========== دوال العرض (جميع الميزات) ==========
+def show_members_filter(chat_id):
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("🔵 المتطوعين", callback_data="filter_type_موظف"),
+        InlineKeyboardButton("🟢 المنخرطين", callback_data="filter_type_عضو"),
+        InlineKeyboardButton("📌 بدون خلية", callback_data="filter_no_cell"),
+        InlineKeyboardButton("🏛️ حسب الخلية", callback_data="show_cells_filter")
+    )
+    bot.send_message(chat_id, "👥 *فلترة الأعضاء*\nاختر نوع الفلترة:", parse_mode='Markdown', reply_markup=markup)
+
+def show_cells_menu(chat_id):
+    cells = get_all_cells()
+    markup = InlineKeyboardMarkup(row_width=1)
+    for cell in cells:
+        count = len(get_members_by_cell(cell))
+        markup.add(InlineKeyboardButton(f"{cell} ({count})", callback_data=f"filter_cell_{cell}"))
+    markup.add(InlineKeyboardButton("📌 المنخرطين بدون خلية", callback_data="filter_no_cell"))
+    markup.add(InlineKeyboardButton("🔙 رجوع", callback_data="back_to_admin"))
+    bot.send_message(chat_id, "🏛️ *الخلايا والأقسام*\nاختر خلية لعرض أعضائها:", parse_mode='Markdown', reply_markup=markup)
+
+def show_members_by_type(chat_id, member_type):
+    # member_type قد يكون 'موظف' أو 'عضو'
+    members = [m for m in get_members() if m.get('type') == member_type]
+    icon = "🔵" if member_type == "موظف" else "🟢"
+    type_name = "متطوع" if member_type == "موظف" else "منخرط"
+    if members:
+        text = f"{icon} *قائمة {type_name}ين* ({len(members)})\n\n"
+        for m in members[:30]:
+            cell = m.get('cell', '') or "بدون خلية"
+            text += f"• `{m.get('id')}` - {m.get('fullName')}\n  └ 📌 {cell}\n"
+        if len(members) > 30:
+            text += f"\n*... و {len(members)-30} آخرين*"
+    else:
+        text = f"📭 لا يوجد {type_name}ين"
+    bot.send_message(chat_id, text, parse_mode='Markdown')
+
+def show_members_by_cell(chat_id, cell_name):
+    members = get_members_by_cell(cell_name)
+    if members:
+        text = f"🏛️ *أعضاء خلية: {cell_name}* ({len(members)})\n\n"
+        for m in members:
+            type_icon = "🔵" if m.get('type') == 'موظف' else "🟢"
+            text += f"{type_icon} `{m.get('id')}` - {m.get('fullName')}\n  └ 💼 {get_position_display(m)}\n"
+    else:
+        text = "📭 لا يوجد أعضاء في هذه الخلية"
+    bot.send_message(chat_id, text, parse_mode='Markdown')
+
+def show_members_no_cell(chat_id):
+    members = get_members_without_cell()
+    if members:
+        text = f"📌 *المنخرطين بدون خلية* ({len(members)})\n\n"
+        for m in members:
+            text += f"🟢 `{m.get('id')}` - {m.get('fullName')}\n  └ 📞 {m.get('phone', '-')}\n"
+    else:
+        text = "✅ جميع المنخرطين مسندون لخلايا"
+    bot.send_message(chat_id, text, parse_mode='Markdown')
+
+def show_requests_admin(chat_id):
+    requests = c.execute("SELECT id, request_number, user_name, request_type, status, created_at FROM requests ORDER BY id DESC LIMIT 15").fetchall()
+    if requests:
+        bot.send_message(chat_id, f"📋 *الطلبات الواردة* ({len(requests)} أخيرة)\n", parse_mode='Markdown')
+        for req in requests:
+            status_icon = "🟡" if req[4] == 'pending' else "✅"
+            status_text = "قيد المعالجة" if req[4] == 'pending' else "مكتمل"
+            markup = InlineKeyboardMarkup()
+            markup.add(InlineKeyboardButton("📖 عرض التفاصيل", callback_data=f"view_req_{req[0]}"))
+            if req[4] == 'pending':
+                markup.add(InlineKeyboardButton("✅ تمت المعالجة", callback_data=f"done_req_{req[0]}"))
+            bot.send_message(chat_id, f"{status_icon} *طلب #{req[1]}*\n👤 {req[2]}\n📌 {req[3]}\n📅 {req[5][:16]}\n🏷️ {status_text}", parse_mode='Markdown', reply_markup=markup)
+    else:
+        bot.send_message(chat_id, "📭 *لا توجد طلبات حالياً*", parse_mode='Markdown')
+
+def show_messages_admin(chat_id):
+    msgs = c.execute("SELECT id, from_name, content, date, is_read FROM messages ORDER BY id DESC LIMIT 10").fetchall()
+    if msgs:
+        bot.send_message(chat_id, "📨 *الرسائل الواردة*\n", parse_mode='Markdown')
+        for m in msgs:
+            status = "🔴 جديدة" if not m[4] else "✅ مقروءة"
+            markup = InlineKeyboardMarkup()
+            markup.add(InlineKeyboardButton("📖 رد", callback_data=f"reply_msg_{m[0]}"))
+            bot.send_message(chat_id, f"{status}\n*من:* {m[1]}\n*الرسالة:* {m[2][:200]}...\n*التاريخ:* {m[3][:16]}", parse_mode='Markdown', reply_markup=markup)
+            if not m[4]:
+                c.execute("UPDATE messages SET is_read=1 WHERE id=?", (m[0],))
+                conn.commit()
+    else:
+        bot.send_message(chat_id, "📭 *لا توجد رسائل*", parse_mode='Markdown')
+
+def show_attendance_admin(chat_id):
+    today = datetime.date.today().isoformat()
+    records = c.execute("SELECT user_name, time FROM attendance WHERE date=? ORDER BY time DESC", (today,)).fetchall()
+    if records:
+        text = f"✅ *سجل الحضور - {today}*\n\n"
+        for r in records:
+            text += f"• {r[0]} - الساعة {r[1]}\n"
+        text += f"\n📊 الإجمالي: {len(records)} عضو"
+    else:
+        text = f"📭 *لا يوجد حضور مسجل لليوم {today}*"
+    bot.send_message(chat_id, text, parse_mode='Markdown')
+
+def show_detailed_stats(chat_id):
+    members = get_members()
+    members_count = len(members)
+    volunteers_count = len([m for m in members if m.get('type') == 'موظف'])
+    regular_count = len([m for m in members if m.get('type') == 'عضو'])
+    no_cell_count = len(get_members_without_cell())
+    cells = get_all_cells()
+    
+    requests_count = c.execute("SELECT COUNT(*) FROM requests").fetchone()[0]
+    pending_requests = c.execute("SELECT COUNT(*) FROM requests WHERE status='pending'").fetchone()[0]
+    attendance_count = c.execute("SELECT COUNT(*) FROM attendance WHERE date=?", (datetime.date.today().isoformat(),)).fetchone()[0]
+    unread_messages = c.execute("SELECT COUNT(*) FROM messages WHERE is_read=0").fetchone()[0]
+    total_tasks = c.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+    pending_tasks = c.execute("SELECT COUNT(*) FROM tasks WHERE status='pending'").fetchone()[0]
+    
+    text = f"""
+📊 *إحصائيات شاملة - نظام نزاهة*
+
+👥 *الأعضاء:*
+├ 🔵 متطوعين: {volunteers_count}
+├ 🟢 منخرطين: {regular_count}
+├ 📌 بدون خلية: {no_cell_count}
+└ 🏛️ الخلايا: {len(cells)}
+
+📋 *الطلبات:*
+├ 📝 الواردة: {requests_count}
+└ 🟡 قيد المعالجة: {pending_requests}
+
+⚡ *المهام:*
+├ 📊 الإجمالي: {total_tasks}
+└ 🟡 قيد التنفيذ: {pending_tasks}
+
+✅ *الحضور اليوم:* {attendance_count}
+📨 *رسائل غير مقروءة:* {unread_messages}
+
+📅 *آخر تحديث:* {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}
+    """
+    bot.send_message(chat_id, text, parse_mode='Markdown')
+    
+    # إحصائيات حسب الخلايا
+    if cells:
+        cell_text = "🏛️ *توزيع الأعضاء حسب الخلايا*\n\n"
+        for cell in cells:
+            count = len(get_members_by_cell(cell))
+            cell_text += f"• {cell}: {count} عضو\n"
+        bot.send_message(chat_id, cell_text, parse_mode='Markdown')
+
+def show_activity_logs(chat_id):
+    logs = c.execute("SELECT user_id, action, details, created_at FROM activity_log ORDER BY id DESC LIMIT 20").fetchall()
+    if logs:
+        text = "📜 *سجل النشاطات الأخيرة*\n\n"
+        for log in logs:
+            text += f"• `{log[0]}` | {log[1]}\n  └ {log[2][:50]} - {log[3][:16]}\n"
+    else:
+        text = "📭 لا يوجد سجلات نشاط"
+    bot.send_message(chat_id, text, parse_mode='Markdown')
+
+def show_request_detail(chat_id, req_id):
+    req = c.execute("SELECT * FROM requests WHERE id=? OR request_number=?", (req_id, req_id)).fetchone()
+    if req:
+        status_icon = "🟡" if req[6] == 'pending' else "✅"
+        status_text = "قيد المعالجة" if req[6] == 'pending' else "مكتمل"
+        handled_info = ""
+        if req[8]:
+            handled_info = f"\n👤 *معالج:* {req[8]}\n📅 *تاريخ المعالجة:* {req[9][:16] if req[9] else '-'}"
+        
+        text = f"""
+📋 *تفاصيل الطلب #{req[1]}*
+
+{status_icon} *الحالة:* {status_text}
+
+👤 *مقدم الطلب:* {req[3]}
+🆔 *رقمه:* `{req[2]}`
+📌 *نوع الطلب:* {req[4]}
+
+📝 *التفاصيل:*
+{req[5]}
+
+📅 *تاريخ التقديم:* {req[7][:16]}{handled_info}
+        """
+        markup = InlineKeyboardMarkup()
+        if req[6] == 'pending':
+            markup.add(InlineKeyboardButton("✅ تمت المعالجة", callback_data=f"done_req_{req[0]}"))
+        bot.send_message(chat_id, text, parse_mode='Markdown', reply_markup=markup)
+
+def show_user_requests(chat_id, user_id):
+    requests = c.execute("SELECT request_number, request_type, status, created_at FROM requests WHERE user_id=? ORDER BY id DESC", (user_id,)).fetchall()
+    if requests:
+        text = "📋 *طلباتك*\n\n"
+        for req in requests:
+            status_icon = "🟡" if req[2] == 'pending' else "✅"
+            text += f"{status_icon} *#{req[0]}* - {req[1]}\n📅 {req[3][:16]}\n\n"
+    else:
+        text = "📭 *ليس لديك طلبات مسجلة*"
+    bot.send_message(chat_id, text, parse_mode='Markdown')
+
+def show_tasks_menu(chat_id):
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("📊 جميع المهام", callback_data="admin_all_tasks"),
+        InlineKeyboardButton("➕ إسناد مهمة", callback_data="admin_assign_task_new"),
+        InlineKeyboardButton("🔙 رجوع", callback_data="back_to_admin")
+    )
+    bot.send_message(chat_id, "⚡ *إدارة المهام*", parse_mode='Markdown', reply_markup=markup)
+
+def show_volunteer_tasks(chat_id, user_id):
+    tasks = c.execute("SELECT id, title, description, status, priority, due_date FROM tasks WHERE assigned_to=? ORDER BY id DESC", (user_id,)).fetchall()
+    if tasks:
+        bot.send_message(chat_id, f"⚡ *مهامك* ({len(tasks)})\n", parse_mode='Markdown')
+        for task in tasks:
+            status_icon = "🟡" if task[3] == 'pending' else "✅"
+            priority_icon = "🔴" if task[4] == 'high' else "🟡" if task[4] == 'normal' else "🟢"
+            markup = InlineKeyboardMarkup()
+            if task[3] == 'pending':
+                markup.add(InlineKeyboardButton("✅ إكمال", callback_data=f"task_done_{task[0]}"))
+            text = f"{status_icon} *{task[1]}*\n{priority_icon} أولوية: {task[4]}\n📅 استحقاق: {task[5] or 'غير محدد'}\n\n{task[2][:200]}"
+            bot.send_message(chat_id, text, parse_mode='Markdown', reply_markup=markup)
+    else:
+        bot.send_message(chat_id, "📭 *ليس لديك مهام مسندة حالياً*\nسيتم إسناد مهام لك قريباً", parse_mode='Markdown')
+
+def generate_volunteer_report(chat_id, user_id, user_name):
+    current_month = datetime.date.today().strftime("%Y-%m")
+    attendance_count = c.execute("SELECT COUNT(*) FROM attendance WHERE user_id=? AND date LIKE ?", (user_id, f"{current_month}%")).fetchone()[0]
+    total_tasks = c.execute("SELECT COUNT(*) FROM tasks WHERE assigned_to=?", (user_id,)).fetchone()[0]
+    completed_tasks = c.execute("SELECT COUNT(*) FROM tasks WHERE assigned_to=? AND status='completed'", (user_id,)).fetchone()[0]
+    total_requests = c.execute("SELECT COUNT(*) FROM requests WHERE user_id=?", (user_id,)).fetchone()[0]
+    
+    text = f"""
+📊 *تقريرك الشخصي - {user_name}*
+
+📅 *الشهر الحالي:* {current_month}
+
+✅ *الحضور:*
+├ هذا الشهر: {attendance_count} يوم
+└ اليوم: {"✅" if c.execute("SELECT id FROM attendance WHERE user_id=? AND date=?", (user_id, datetime.date.today().isoformat())).fetchone() else "❌"}
+
+⚡ *المهام:*
+├ الإجمالي: {total_tasks}
+└ المنجزة: {completed_tasks}
+
+📋 *الطلبات المرسلة:* {total_requests}
+
+📈 *نسبة الإنجاز:* {round((completed_tasks/max(total_tasks,1))*100)}%
+    """
+    bot.send_message(chat_id, text, parse_mode='Markdown')
+
+# ========== دوال الخطوات ==========
+def admin_search_member(message):
+    chat_id = message.chat.id
+    keyword = message.text.strip()
+    
+    member = get_member_by_id(keyword)
+    if not member:
+        member = get_member_by_name(keyword)
+    
+    if member:
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("📨 إرسال رسالة", callback_data=f"admin_msg_{member.get('id')}"))
+        markup.add(InlineKeyboardButton("➕ إسناد مهمة", callback_data=f"admin_assign_task_{member.get('id')}"))
+        bot.send_message(chat_id, format_member_info(member), parse_mode='Markdown', reply_markup=markup)
+    else:
+        bot.send_message(chat_id, "❌ *لم يتم العثور على عضو بهذا الاسم أو الرقم*", parse_mode='Markdown')
+    admin_menu(chat_id)
+
+def user_search_member(message):
+    chat_id = message.chat.id
+    keyword = message.text.strip()
+    
+    member = get_member_by_id(keyword)
+    if not member:
+        member = get_member_by_name(keyword)
+    
+    if member:
+        bot.send_message(chat_id, format_member_info(member), parse_mode='Markdown')
+    else:
+        bot.send_message(chat_id, "❌ *لم يتم العثور على عضو بهذا الاسم أو الرقم*", parse_mode='Markdown')
+
+def save_user_message(message, session):
+    if session:
+        content = message.text
+        c.execute("INSERT INTO messages (from_id, from_name, to_id, content, date, is_read) VALUES (?, ?, ?, ?, ?, ?)",
+                  (session[0], session[1], 'ADMIN', content, datetime.datetime.now().isoformat(), 0))
+        conn.commit()
+        
+        admin_text = f"📨 *رسالة جديدة من {session[1]}*\n🆔 `{session[0]}`\n\n{content[:300]}"
+        send_notification_to_admin(admin_text, InlineKeyboardMarkup().add(InlineKeyboardButton("📖 رد", callback_data=f"reply_{session[0]}")))
+        
+        bot.send_message(message.chat.id, "✅ *تم إرسال رسالتك للإدارة*\nسيتم الرد عليك قريباً", parse_mode='Markdown')
+        log_activity(session[0], 'send_message')
+
+def get_article_title(message, session):
+    title = message.text
+    msg = bot.send_message(message.chat.id, "📝 *أرسل محتوى المقال:*", parse_mode='Markdown')
+    bot.register_next_step_handler(msg, save_article, session, title)
+
+def save_article(message, session, title):
+    content = message.text
+    req_number = generate_request_number()
+    details = f"**العنوان:** {title}\n\n**المحتوى:**\n{content}"
+    
+    c.execute("INSERT INTO requests (request_number, user_id, user_name, request_type, details, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+              (req_number, session[0], session[1], 'نشر مقال', details, datetime.datetime.now().isoformat()))
+    conn.commit()
+    
+    admin_text = f"📝 *طلب نشر مقال جديد*\n\n📋 *الرقم:* `{req_number}`\n👤 *من:* {session[1]}\n📌 *العنوان:* {title}"
+    send_notification_to_admin(admin_text, InlineKeyboardMarkup().add(InlineKeyboardButton("📋 عرض", callback_data=f"view_req_{req_number}")))
+    
+    bot.send_message(message.chat.id, "✅ *تم إرسال طلب نشر المقال للإدارة*\nسيتم مراجعته ونشره قريباً", parse_mode='Markdown')
+    log_activity(session[0], 'article_request', title)
+
+def save_update_request(message, session):
+    details = message.text
+    req_number = generate_request_number()
+    
+    c.execute("INSERT INTO requests (request_number, user_id, user_name, request_type, details, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+              (req_number, session[0], session[1], 'تعديل بيانات', details, datetime.datetime.now().isoformat()))
+    conn.commit()
+    
+    admin_text = f"✏️ *طلب تعديل بيانات*\n\n📋 *الرقم:* `{req_number}`\n👤 *من:* {session[1]}\n📝 *التفاصيل:* {details[:200]}"
+    send_notification_to_admin(admin_text, InlineKeyboardMarkup().add(InlineKeyboardButton("📋 عرض", callback_data=f"view_req_{req_number}")))
+    
+    bot.send_message(message.chat.id, "✅ *تم إرسال طلب تعديل البيانات للإدارة*\nسيتم مراجعته", parse_mode='Markdown')
+    log_activity(session[0], 'update_request')
+
+def send_broadcast(message):
+    chat_id = message.chat.id
+    broadcast_text = message.text
+    
+    users = c.execute("SELECT chat_id FROM sessions WHERE role != 'admin' AND role != 'temp'").fetchall()
     sent = 0
-    for u in users:
+    for user in users:
         try:
-            bot.send_message(u[0], f"📢 *إشعار من الإدارة*\n\n{text}", parse_mode='Markdown')
+            bot.send_message(user[0], f"📢 *إشعار من الإدارة*\n\n{broadcast_text}", parse_mode='Markdown')
             sent += 1
         except:
             pass
-    bot.send_message(chat_id, f"تم إرسال الإشعار إلى {sent} مستخدم.")
+    
+    bot.send_message(chat_id, f"✅ *تم إرسال الإشعار إلى {sent} مستخدم*", parse_mode='Markdown')
+    log_activity('ADMIN', 'broadcast', f"sent_to: {sent}")
+    admin_menu(chat_id)
 
-def show_initiatives(chat_id):
-    # يمكن جلب المبادرات من JSON آخر، أو نعرض نموذج
-    bot.send_message(chat_id, "💡 المبادرات الحالية:\n- مبادرة تعزيز النزاهة في الجامعات\n- حملة 'شباب بلا فساد'\n- برنامج تدريب سفراء النزاهة")
-    # يمكن توسيعها باستخدام قاعدة بيانات
-
-def show_activities(chat_id):
-    activities = c.execute("SELECT title, date, location FROM activities ORDER BY date DESC").fetchall()
-    if not activities:
-        bot.send_message(chat_id, "لا توجد نشاطات مسجلة حالياً.")
-        return
-    text = "📅 *النشاطات القادمة والسابقة*\n\n"
-    for a in activities:
-        text += f"• {a[0]} - {a[1]} - {a[2]}\n"
-    bot.send_message(chat_id, text, parse_mode='Markdown')
-
-def show_requests(chat_id):
-    reqs = c.execute("SELECT id, from_name, request_type, details, date, status FROM requests ORDER BY id DESC").fetchall()
-    if not reqs:
-        bot.send_message(chat_id, "لا توجد طلبات حالياً.")
-        return
-    for r in reqs:
-        markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("✅ تم المعالجة", callback_data=f"admin_req_done_{r[0]}"))
-        text = f"📋 *طلب #{r[0]}*\nمن: {r[1]}\nالنوع: {r[2]}\nالتفاصيل: {r[3]}\nالتاريخ: {r[4]}\nالحالة: {r[5]}"
-        bot.send_message(chat_id, text, parse_mode='Markdown', reply_markup=markup)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("admin_req_done_"))
-def mark_request_done(call):
-    req_id = int(call.data.split("_")[3])
-    c.execute("UPDATE requests SET status='completed' WHERE id=?", (req_id,))
+def send_reply(message, to_user_id, to_name):
+    reply_content = message.text
+    
+    c.execute("INSERT INTO messages (from_id, from_name, to_id, content, date, is_read) VALUES (?, ?, ?, ?, ?, ?)",
+              ('ADMIN', 'مدير النظام', to_user_id, reply_content, datetime.datetime.now().isoformat(), 0))
     conn.commit()
-    bot.answer_callback_query(call.id, "تم تحديث حالة الطلب إلى مكتمل.")
+    
+    user_chat = c.execute("SELECT chat_id FROM sessions WHERE user_id=?", (to_user_id,)).fetchone()
+    if user_chat:
+        try:
+            bot.send_message(user_chat[0], f"📨 *رد من الإدارة*\n\n{reply_content}", parse_mode='Markdown')
+        except:
+            pass
+    
+    bot.send_message(message.chat.id, f"✅ *تم إرسال الرد إلى {to_name}*", parse_mode='Markdown')
+    log_activity('ADMIN', 'reply_message', f"to: {to_name}")
+    admin_menu(message.chat.id)
 
-# ------------------- تشغيل البوت مع إعادة تشغيل تلقائي -------------------
+def assign_task_admin(message):
+    chat_id = message.chat.id
+    try:
+        parts = message.text.split("|")
+        if len(parts) >= 3:
+            user_id = parts[0].strip()
+            title = parts[1].strip()
+            description = parts[2].strip()
+            priority = parts[3].strip() if len(parts) > 3 else 'normal'
+            due_date = parts[4].strip() if len(parts) > 4 else None
+            
+            member = get_member_by_id(user_id)
+            if not member:
+                bot.send_message(chat_id, "❌ *رقم المتطوع غير موجود*", parse_mode='Markdown')
+                return
+            
+            c.execute("INSERT INTO tasks (title, description, assigned_to, assigned_by, priority, created_at, due_date) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                      (title, description, user_id, 'ADMIN', priority, datetime.datetime.now().isoformat(), due_date))
+            conn.commit()
+            
+            bot.send_message(chat_id, f"✅ *تم إسناد المهمة*\n\n👤 للمتطوع: {member.get('fullName')}\n📌 العنوان: {title}\n🔴 الأولوية: {priority}", parse_mode='Markdown')
+            
+            # إشعار المتطوع
+            user_chat = c.execute("SELECT chat_id FROM sessions WHERE user_id=?", (user_id,)).fetchone()
+            if user_chat:
+                try:
+                    bot.send_message(user_chat[0], f"⚡ *مهمة جديدة مسندة إليك*\n\n📌 {title}\n🔴 أولوية: {priority}\n📅 استحقاق: {due_date or 'غير محدد'}\n\n{description[:200]}", parse_mode='Markdown')
+                except:
+                    pass
+            log_activity('ADMIN', 'assign_task', f"to: {user_id}, title: {title}")
+        else:
+            bot.send_message(chat_id, "❌ *صيغة غير صحيحة*\nاستخدم: `رقم|عنوان|وصف|أولوية|تاريخ`", parse_mode='Markdown')
+    except Exception as e:
+        bot.send_message(chat_id, f"❌ *خطأ:* {str(e)}", parse_mode='Markdown')
+    admin_menu(chat_id)
+
+# ========== تشغيل البوت ==========
 def start_bot():
     while True:
         try:
-            logging.info("بوت نزاهة يعمل الآن...")
-            bot.polling(none_stop=True, interval=0, timeout=30)
+            logging.info("✅ بوت نزاهة يعمل الآن...")
+            bot.polling(none_stop=True, interval=0, timeout=60)
         except Exception as e:
-            logging.error(f"توقف البوت: {e}. إعادة التشغيل خلال 5 ثوانٍ...")
+            logging.error(f"❌ توقف البوت: {e}. إعادة التشغيل خلال 5 ثوانٍ...")
             time.sleep(5)
 
 if __name__ == "__main__":
