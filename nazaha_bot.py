@@ -12,7 +12,7 @@ import threading
 from collections import defaultdict
 
 # ========== الإعدادات والأمان ==========
-TOKEN = os.environ.get('NAZAHA_BOT_TOKEN', 'YOUR_BOT_TOKEN_HERE')  # ضع التوكن الخاص بك هنا
+TOKEN = os.environ.get('NAZAHA_BOT_TOKEN', '8459034854:AAFOvbK3i2jJS8fNkGP8TAS6F2yvW6c_UiE')  # ضع التوكن الخاص بك هنا
 ADMIN_PASSWORD = os.environ.get('NAZAHA_ADMIN_PASSWORD', 'nazaha2026')
 JSON_MEMBERS_URL = 'https://raw.githubusercontent.com/nazahaa36/com/main/member.json'
 BACKUP_DIR = 'backups'
