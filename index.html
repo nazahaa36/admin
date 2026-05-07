@@ -1,4 +1,3 @@
-```html
 <!DOCTYPE html>
 <html lang="ar" dir="rtl">
 <head>
@@ -2940,7 +2939,6 @@
                     </div>
                     <div class="text-left">
                         <p class="text-[10px] font-black text-slate-500">الجمهورية الجزائرية الديمقراطية الشعبية</p>
-                        <p class="text-[9px] text-slate-400 mt-1 font-bold">نزاهة - مشاركة مدنية - بناء القدرات</p>
                     </div>
                 </div>
             `;
@@ -2949,9 +2947,9 @@
             const docFooter = `
                 <div class="mt-12 pt-8 border-t border-slate-100 grid grid-cols-2 gap-4">
                     <div class="flex flex-col items-center justify-center text-center">
-                        <p class="text-xs font-bold text-slate-500 mb-3">اعتماد وتوقيع رئيس الهيئة التنفيذية</p>
+                        <p class="text-xs font-bold text-slate-500 mb-3">اعتماد وتوقيع رئيس المنتدى</p>
                         <div class="h-20 flex items-center justify-center relative">
-                            ${sig ? `<img src="${sig}" class="max-h-full object-contain z-10">` : `<span class="text-xs text-slate-300 font-bold">التوقيع التنفيذي</span>`}
+                            ${sig ? `<img src="${sig}" class="max-h-full object-contain z-10">` : `<span class="text-xs text-slate-300 font-bold">التوقيع</span>`}
                             ${seal ? `<img src="${seal}" class="absolute w-16 h-16 object-contain opacity-70 z-0">` : ''}
                         </div>
                     </div>
@@ -2981,7 +2979,7 @@
                                     ${logo ? `<img src="${logo}" class="w-10 h-10 object-contain">` : `<div class="w-10 h-10 rounded-xl bg-forumPrimary text-white flex items-center justify-center font-bold text-xs">YF</div>`}
                                     <div>
                                         <h3 class="font-black text-xs text-forumPrimary">${systemState.settings.forumName}</h3>
-                                        <p class="text-[9px] text-slate-400 font-bold mt-0.5">بطاقة منخرط مستفيد معتمدة</p>
+                                        <p class="text-[9px] text-slate-400 font-bold mt-0.5">بطاقة منخرط</p>
                                     </div>
                                 </div>
                                 <span class="text-[9px] font-black px-2.5 py-0.5 rounded-full bg-emerald-100 text-emerald-800">${m.status}</span>
@@ -3031,7 +3029,7 @@
                                     ${logo ? `<img src="${logo}" class="w-10 h-10 object-contain">` : `<div class="w-10 h-10 rounded-xl bg-amber-700 text-white flex items-center justify-center font-bold text-xs">YF</div>`}
                                     <div>
                                         <h3 class="font-black text-xs text-amber-900">${systemState.settings.forumName}</h3>
-                                        <p class="text-[9px] text-amber-700 font-bold mt-0.5">بطاقة متطوع إداري (شؤون القيادة)</p>
+                                        <p class="text-[9px] text-amber-700 font-bold mt-0.5">بطاقة متطوع إداري</p>
                                     </div>
                                 </div>
                                 <span class="text-[9px] font-black px-2.5 py-0.5 rounded-full bg-amber-600 text-white">${v.status}</span>
@@ -3062,9 +3060,9 @@
                                 <svg id="barcodeTargetSVG"></svg>
                             </div>
                             <div class="flex justify-between items-end mt-4">
-                                <span class="text-[8px] text-amber-800 font-bold">رئاسة الهيئة الإدارية للتطوع واللجان</span>
+                                <span class="text-[8px] text-amber-800 font-bold">رئاسة المنتدى</span>
                                 <div class="w-12 h-12 flex items-center justify-center">
-                                    ${seal ? `<img src="${seal}" class="w-full h-full object-contain">` : `<span class="text-[8px] text-amber-500 font-bold">الختم المعتمد</span>`}
+                                    ${seal ? `<img src="${seal}" class="w-full h-full object-contain">` : `<span class="text-[8px] text-amber-500 font-bold">الختم الرئيس</span>`}
                                 </div>
                             </div>
                         </div>
@@ -3095,7 +3093,7 @@
                 // توليد رمز التحقق الرقمي QR للشهادة للحد من تزوير المستندات
                 setTimeout(() => {
                     new QRCode(document.getElementById("docLiveQrVerification"), {
-                        text: `https://verification.forum.dz/cert/${encodeURIComponent(name)}`,
+                        text: `https://verification.nazaha.dz/cert/${encodeURIComponent(name)}`,
                         width: 76,
                         height: 76
                     });
